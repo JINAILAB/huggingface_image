@@ -91,12 +91,13 @@ def main(args):
     
 
     dataset = load_from_disk(args.dataset_dir)
-    # print(dataset)
     
-    labels = list(set(dataset['train']['label']))
-    id2label = dict(zip([i for i in range(len(labels))], labels))
-    label2id = dict(zip(labels, [i for i in range(len(labels))]))
     
+    labels = dataset["train"].features["label"].names
+    label2id, id2label = dict(), dict()
+    for i, label in enumerate(labels):
+        label2id[label] = i
+        id2label[i] = label
     
     
     train_ds, valid_ds = load_dataset(dataset, args)
@@ -109,15 +110,14 @@ def main(args):
         id2label=id2label,
         ignore_mismatched_sizes = True, # provide this in case you're planning to fine-tune an already fine-tuned checkpoint
     ).to('cuda')
-    # if args.torch_compile:
-    #     model=torch.compile(model)
+
     
     trainargs = TrainingArguments(
         output_dir = output_dir,
         remove_unused_columns=False,
         evaluation_strategy = "epoch",
         save_strategy = "epoch",
-        learning_rate=args.lr, 
+        learning_rate=args.lr,
         lr_scheduler_type='constant_with_warmup',
         per_device_train_batch_size=args.batch_size,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
@@ -152,13 +152,17 @@ def main(args):
     
     trainer.train()
     trainer.save_model(os.path.join(output_dir, 'best.hf'))
+    wandb.finish(exit_code=0)
     
     preds_output= trainer.predict(valid_ds)
-    y_preds = np.argmax(preds_output.predictions, axis=1)
+    y_preds = np.argmax(preds_output.predictions, axis=-1)
     y_valid = np.array(valid_ds['label'])
     save_confusion_matrix(y_preds, y_valid, labels, output_dir)
     
-    wandb.finish()
+
+    
+     
+    
     
     
 

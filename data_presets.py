@@ -29,17 +29,14 @@ class ClassificationPresetTrain:
         ra_magnitude=9,
         augmix_severity=3,
         random_erase_prob=0.0,
-        backend="pil",
         use_v2=False,
     ):
         T = get_module(use_v2)
 
         transforms = []
-        backend = backend.lower()
-        if backend == "tensor":
-            transforms.append(T.PILToTensor())
-        elif backend != "pil":
-            raise ValueError(f"backend can be 'tensor' or 'pil', but got {backend}")
+
+        transforms.append(T.PILToTensor())
+
 
         transforms.append(T.RandomResizedCrop(crop_size, interpolation=interpolation, antialias=True))
         if hflip_prob > 0:
@@ -55,8 +52,6 @@ class ClassificationPresetTrain:
                 aa_policy = T.AutoAugmentPolicy(auto_augment_policy)
                 transforms.append(T.AutoAugment(policy=aa_policy, interpolation=interpolation))
 
-        if backend == "pil":
-            transforms.append(T.PILToTensor())
 
         transforms.extend(
             [
@@ -84,25 +79,18 @@ class ClassificationPresetEval:
         resize_size=256,
         mean=(0.485, 0.456, 0.406), 
         std=(0.229, 0.224, 0.225),
-        interpolation=InterpolationMode.BILINEAR,
-        backend="pil",
+        interpolation=InterpolationMode.BICUBIC,
         use_v2=False,
     ):
         T = get_module(use_v2)
         transforms = []
-        backend = backend.lower()
-        if backend == "tensor":
-            transforms.append(T.PILToTensor())
-        elif backend != "pil":
-            raise ValueError(f"backend can be 'tensor' or 'pil', but got {backend}")
+        transforms.append(T.PILToTensor())
+
 
         transforms += [
             T.Resize(resize_size, interpolation=interpolation, antialias=True),
             T.CenterCrop(crop_size),
         ]
-
-        if backend == "pil":
-            transforms.append(T.PILToTensor())
 
         transforms += [
             T.ToDtype(torch.float, scale=True) if use_v2 else T.ConvertImageDtype(torch.float),
@@ -128,8 +116,9 @@ def preprocess_train(batch, train_transforms):
 
 def preprocess_valid(batch, valid_transforms):
     """Apply train_transforms across a batch."""
-    batch["pixel_values"] = [
-        valid_transforms(image.convert("RGB")) for image in batch["image"]
+    if "image" in batch:
+        batch["pixel_values"] = [
+            valid_transforms(image.convert("RGB")) for image in batch["image"]
     ]
     return batch
 
@@ -156,7 +145,6 @@ def load_dataset(dataset, args):
                 random_erase_prob=random_erase_prob,
                 ra_magnitude=ra_magnitude,
                 augmix_severity=augmix_severity,
-                backend=args.backend,
                 use_v2=args.use_v2,
             )
     
@@ -164,21 +152,15 @@ def load_dataset(dataset, args):
                 crop_size=val_crop_size,
                 resize_size=val_resize_size,
                 interpolation=interpolation,
-                backend=args.backend,
+
                 use_v2=args.use_v2,
             )
-
     
-    if args.testval_dataset:
-        train_ds = dataset['train']
-        val_ds = dataset['valid']
-    else:
-        splits = dataset["train"].train_test_split(test_size=args.test_size, stratify_by_column='label')
-        train_ds = splits['train']
-        val_ds = splits['test']
+    train_ds = dataset['train']
+    val_ds = dataset['test']
+    
     
     train_ds.set_transform(lambda batch: preprocess_train(batch, train_transform))
-    val_ds.set_transform(lambda batch: preprocess_train(batch, valid_transform))
-    
-    
+    val_ds.set_transform(lambda batch: preprocess_valid(batch, valid_transform))
+
     return train_ds, val_ds
