@@ -12,7 +12,9 @@ import torch
 from typing import List, Callable, Optional
 from functools import partial
 import torch
-
+from data_presets import ClassificationPresetEval
+import os
+from tqdm import tqdm
 
 class HuggingfaceToTensorModelWrapper(torch.nn.Module):
     def __init__(self, model):
@@ -44,6 +46,8 @@ def run_grad_cam_on_image(model: torch.nn.Module,
                           reshape_transform: Optional[Callable],
                           input_tensor: torch.nn.Module,
                           input_image: Image,
+                          top_categories: List,
+                          label: str,
                           method: Callable=GradCAMPlusPlus):
     with method(model=HuggingfaceToTensorModelWrapper(model),
                  target_layers=[target_layer],
@@ -55,22 +59,33 @@ def run_grad_cam_on_image(model: torch.nn.Module,
         batch_results = cam(input_tensor=repeated_tensor,
                             targets=targets_for_gradcam)
         results = []
-        for grayscale_cam in batch_results:
+        
+        for grayscale_cam, top_cateogry in zip(batch_results, top_categories):
             visualization = show_cam_on_image(np.float32(input_image)/255,
                                               grayscale_cam,
                                               use_rgb=True)
             # Make it weight less in the notebook:
             visualization = cv2.resize(visualization,
-                                       (visualization.shape[1]//2, visualization.shape[0]//2))
+                                       (visualization.shape[1] * 2, visualization.shape[0] * 2))
+            
+            cv2.putText(visualization, f"Pred: {top_cateogry}", (5, 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255))
+            cv2.putText(visualization, f"Label: {label}", (5, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255))
+            
             results.append(visualization)
+        
+        # 원본사진 추가
+        results.append(cv2.resize(np.uint8(input_image), (np.uint8(input_image).shape[1] * 2, np.uint8(input_image).shape[0] * 2)))
+        
         return np.hstack(results)
     
     
-def print_top_categories(model, img_tensor, top_k=5):
+def print_top_categories(model, img_tensor, top_k=2):
+    top_categories_list = []
     logits = model(img_tensor.unsqueeze(0)).logits
     indices = logits.cpu()[0, :].detach().numpy().argsort()[-top_k :][::-1]
     for i in indices:
-        print(f"Predicted class {i}: {model.config.id2label[i]}")
+        top_categories_list.append(model.config.id2label[i])
+    return top_categories_list
     
 
 def get_target_layer(model): 
@@ -80,6 +95,8 @@ def get_target_layer(model):
     # Swin Transformer
     if hasattr(model, 'swin'):
         return model.swin.layernorm, model.swin.layernorm
+    if hasattr(model, 'swinv2'):
+        return model.swinv2.layernorm, model.swinv2.layernorm
     # ConvNeXt
     elif hasattr(model, 'convnext'):
         return model.convnext.encoder.stages[-1].layers[-1], model.convnext.encoder.stages[-1].layers[-1]
@@ -142,14 +159,19 @@ def reshape_transform_vit_huggingface(x):
 
     
     
-def reshape_transform_generic(tensor, model, img_tensor):
+def reshape_transform_generic(model, img_tensor):
     # Determining the dimensions
     width, height = img_tensor.shape[2], img_tensor.shape[1]
-    batch, features, tensor_height, tensor_width = tensor.shape
+    features, tensor_height, tensor_width = img_tensor.shape
 
     # Swin Transformer
     if hasattr(model, 'swin'):
-        reshape_transform = partial(swinT_reshape_transform_huggingface(tensor, tensor_width // 32, tensor_height // 32))
+        reshape_transform = partial(swinT_reshape_transform_huggingface(img_tensor, tensor_width // 32, tensor_height // 32))
+        
+        return reshape_transform, reshape_transform
+    
+    if hasattr(model, 'swinv2'):
+        reshape_transform = partial(swinT_reshape_transform_huggingface(img_tensor, tensor_width // 32, tensor_height // 32))
         
         return reshape_transform, reshape_transform
 
@@ -181,3 +203,62 @@ def reshape_transform_generic(tensor, model, img_tensor):
     else:
         # Handle unknown model or return a default transformation
         return None, None
+
+
+def save_gradcam_one_image(image, label, model, img_tensor, save_dir1, save_dir2, val_crop_size):
+    image = image.convert('RGB').resize([val_crop_size, val_crop_size])
+    top_categories = print_top_categories(model, img_tensor)
+    targets_for_gradcam = [ClassifierOutputTarget(category_name_to_index(model, top_categories[0])),
+                    ClassifierOutputTarget(category_name_to_index(model, top_categories[1]))]
+    
+    target_layer_dff, target_layer_gradcam = get_target_layer(model)
+    dff_transform, gradcam_transform = reshape_transform_generic(model, img_tensor)
+    
+    image1 = Image.fromarray(run_dff_on_image(model=model,
+                        target_layer=target_layer_dff,
+                        classifier=model.classifier,
+                        img_pil=image,
+                        img_tensor=img_tensor,
+                        reshape_transform=dff_transform,
+                        n_components=2,
+                        top_k=2))
+    image1.save(save_dir1)
+    
+    image2 = Image.fromarray(run_grad_cam_on_image(model=model,
+                    target_layer=target_layer_gradcam,
+                    targets_for_gradcam=targets_for_gradcam,
+                    reshape_transform=gradcam_transform,
+                    input_tensor=img_tensor,
+                    input_image=image,
+                    top_categories=top_categories,
+                    label=label))
+    image2.save(save_dir2)
+    
+    
+def save_gradcam(model, id2label, output_dir, valid_ds, valid_transform, val_crop_size):
+    os.makedirs(os.path.join(output_dir, 'gradcam'))
+    model = model.to('cpu')
+    for idx, set in tqdm(enumerate(valid_ds)):
+        image = set['image']
+        label = id2label[set['label']]
+        img_tensor = valid_transform(image)
+        os.makedirs(output_dir, exist_ok=True)
+        save_dir1 = os.path.join(output_dir, 'gradcam', f'{idx}_1.png')
+        save_dir2 = os.path.join(output_dir, 'gradcam', f'{idx}_2.png')
+        save_gradcam_one_image(image, label, model, img_tensor, save_dir1, save_dir2, val_crop_size)
+        
+        
+        
+        
+        
+        
+        
+        
+    
+    
+
+
+
+
+
+

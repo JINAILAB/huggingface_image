@@ -1,7 +1,7 @@
 from transformers import AutoImageProcessor, AutoModelForImageClassification, TrainingArguments, Trainer, EarlyStoppingCallback
 import torch
 import datetime
-from image_utils import save_confusion_matrix, compute_metrics
+from image_utils import save_confusion_matrix, compute_metrics, create_hook, get_embedding_layer, save_umap, check_embedding
 import argparse
 from datasets import load_from_disk
 from data_presets import load_dataset
@@ -9,7 +9,8 @@ import os
 import numpy as np
 import wandb
 import logging
-
+from pytorch_grad_cam.utils.model_targets import ClassifierOutputTarget
+from gradcam_utils import category_name_to_index, save_gradcam
 
  
 
@@ -17,14 +18,14 @@ def get_args_parser(add_help=True):
 
     parser = argparse.ArgumentParser(description="Huggingface Classification Training", add_help=add_help)
     
-    parser.add_argument("--project_name", default='new_hipjoint', type=str,
+    parser.add_argument("--project-name", default='small_hipjoint', type=str,
                         help='This is the project name of wandb and save folder name')
-    parser.add_argument("--dataset-dir", default="new_hipjoint_hfdataset", type=str,
+    parser.add_argument("--dataset-dir", default="small_hiphf", type=str,
                         help="dataset path")
     parser.add_argument("--model", default="microsoft/resnet-50", type=str, help="we only support hugginface pretrained model. check here https://huggingface.co/models?pipeline_tag=image-classification&sort=trending. \
                         microsoft/resnet-50, microsoft/swin-tiny-patch4-window7-224, facebook/convnext-large-224")
     parser.add_argument("-b", "--batch-size", default=128, type=int)
-    parser.add_argument("--epochs", default=40, type=int, metavar="N")
+    parser.add_argument("--epochs", "-e", default=80, type=int, metavar="N")
     parser.add_argument("--lr", default=0.001, type=float, help="initial learning rate")
     parser.add_argument(
         "--wd",
@@ -41,22 +42,19 @@ def get_args_parser(add_help=True):
     parser.add_argument("--mixup-alpha", default=0, type=float, help="mixup alpha (recommend: 0.2)")
     parser.add_argument("--cutmix-alpha", default=0, type=float, help="cutmix alpha (recommend: 1.0)")
     parser.add_argument("--lr-scheduler", default="cosineannealinglr", type=str, help="the lr scheduler (default: cosineannealinglr)")
-    parser.add_argument("--lr-warmup-epochs", default=5, type=int,
+    parser.add_argument("--lr-warmup-epochs", default=3, type=int,
                         help="the number of epochs to warmup (default: 0)")
     parser.add_argument("--custom-processor", action="store_true",
                         help="the number of epochs to warmup (default: 0)")
     parser.add_argument("--use-v2", action="store_true", help="Use V2 transforms")
-    parser.add_argument("--early-stopping-epoch", default=8, type=int, help='early-stopping-epoch')
+    parser.add_argument("--early-stopping-epoch", default=10, type=int, help='early-stopping-epoch')
     parser.add_argument("--fp16", action="store_true", help='fp16, operate like amp.')
     parser.add_argument("--report", default='wandb', type=str, help='support azure_ml, clearml, codecarbon, comet_ml, dagshub, dvclive, flyte, mlflow, neptune, tensorboard, and wandb. recommend : wandb and tensorboard')
     parser.add_argument(
-        "--val-resize-size", default=256, type=int, help="the resize size used for validation (default: 256)"
+        "--resize-size", default=None, type=int, help="the resize size used for validation (default: 256)"
     )
     parser.add_argument(
-        "--val-crop-size", default=224, type=int, help="the central crop size used for validation (default: 224)"
-    )
-    parser.add_argument(
-        "--train-crop-size", default=224, type=int, help="the random crop size used for training (default: 224)"
+        "--crop-pct", default=None, type=int, help="resize and crop for train. and centercrop for validate resizesize * croppct.  (recommend = 0.875)"
     )
     parser.add_argument(
         "--interpolation", default="bilinear", type=str, help="the interpolation method (default: bilinear)"
@@ -64,8 +62,10 @@ def get_args_parser(add_help=True):
     parser.add_argument(
         "--torch-compile", default=False, type=bool, help="torch-compile make your model fast."
     )
-    parser.add_argument("--auto-augment", default='ta_wide', type=str, help="auto augment policy (default: None)")
-    parser.add_argument("--gradient-accumulation-steps", '-g', default=8, type=int, help="auto augment policy (default: None)")
+    parser.add_argument("--auto-augment", default='ta_wide', type=str, help="auto augment policy (default: ta_wide)")
+    parser.add_argument("--gradient-accumulation-steps", '-g', default=8, type=int, help="help batchnormalization for small batch.")
+    parser.add_argument("--gradcam", action="store_true", help='visualize gradcam for validset')
+    parser.add_argument("--umap", action="store_true", help='visualize umap for validset')
     
     return parser
 
@@ -81,13 +81,16 @@ def main(args):
     
     logger = logging.getLogger(__name__)
     # 현재 날짜와 시간을 얻습니다.
+    # print(args)
+    # logger.debug(args)
     now = datetime.datetime.now()
     now = now.strftime("%Y%m%d_%H%M")
 
     
     model_name = args.model.split("/")[-1]
     output_dir = os.path.join(args.project_name, model_name + '_' + now)
-    wandb.init(project=args.project_name, name=model_name + '_' + now)
+    if args.report == 'wandb':
+        wandb.init(project=args.project_name, name=model_name + '_' + now)
     
 
     dataset = load_from_disk(args.dataset_dir)
@@ -99,11 +102,24 @@ def main(args):
         label2id[label] = i
         id2label[i] = label
     
-    
-    train_ds, valid_ds = load_dataset(dataset, args)
-
-
     image_processor  = AutoImageProcessor.from_pretrained(args.model)
+    
+    if args.resize_size is None:
+        if 'height' in image_processor.size:
+            args.val_resize_size = image_processor.size['height']
+        if 'shortest_edge' in image_processor.size:
+            args.val_resize_size = image_processor.size['shortest_edge']
+    if args.crop_pct is None:
+        if hasattr(image_processor, 'crop_pct'):
+            args.train_crop_size = int(image_processor.crop_pct * args.val_resize_size)
+            args.val_crop_size = int(image_processor.crop_pct * args.val_resize_size)
+        else:
+            args.train_crop_size = args.val_resize_size
+            args.val_crop_size = args.val_resize_size
+    
+    train_ds, valid_ds, _, valid_transform = load_dataset(dataset, args)
+
+    
     model = AutoModelForImageClassification.from_pretrained(
         args.model, 
         label2id=label2id,
@@ -128,7 +144,7 @@ def main(args):
         load_best_model_at_end=True,
         metric_for_best_model="roc_auc_macro",
         push_to_hub=False,
-        report_to='wandb',
+        report_to=args.report,
         logging_dir= output_dir,
         fp16=args.fp16,
         logging_steps=10,
@@ -152,13 +168,28 @@ def main(args):
     
     trainer.train()
     trainer.save_model(os.path.join(output_dir, 'best.hf'))
-    wandb.finish(exit_code=0)
+    if args.report == 'wandb':
+        wandb.finish(exit_code=0)
+    
+    if args.umap:
+        hook, embedding_outputs = create_hook()
+        embedding = get_embedding_layer(model)
+        hook_handle = embedding.register_forward_hook(hook)
     
     preds_output= trainer.predict(valid_ds)
     y_preds = np.argmax(preds_output.predictions, axis=-1)
     y_valid = np.array(valid_ds['label'])
     save_confusion_matrix(y_preds, y_valid, labels, output_dir)
     
+    if args.umap:
+        all_embeddings = check_embedding(model, embedding_outputs)
+        save_umap(all_embeddings, y_valid, labels, output_dir)
+        hook_handle.remove()
+    
+    if args.gradcam:
+        save_gradcam(model, id2label, output_dir, valid_ds, valid_transform, args.val_crop_size)
+        
+        
 
     
      
@@ -171,4 +202,3 @@ def main(args):
 if __name__ == '__main__':
     args = get_args_parser().parse_args()
     main(args)
-    

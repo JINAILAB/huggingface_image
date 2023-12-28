@@ -152,7 +152,6 @@ def load_dataset(dataset, args):
                 crop_size=val_crop_size,
                 resize_size=val_resize_size,
                 interpolation=interpolation,
-
                 use_v2=args.use_v2,
             )
     
@@ -163,4 +162,4 @@ def load_dataset(dataset, args):
     train_ds.set_transform(lambda batch: preprocess_train(batch, train_transform))
     val_ds.set_transform(lambda batch: preprocess_valid(batch, valid_transform))
 
-    return train_ds, val_ds
+    return train_ds, val_ds, train_transform, valid_transform
