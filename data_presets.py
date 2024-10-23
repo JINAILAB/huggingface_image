@@ -1,6 +1,16 @@
 import torch
 from torchvision.transforms.functional import InterpolationMode
-
+import datasets
+from torchvision.transforms import (
+    CenterCrop,
+    Compose,
+    Normalize,
+    RandomHorizontalFlip,
+    RandomResizedCrop,
+    Resize,
+    ToTensor,
+    RandomRotation
+)
 
 def get_module(use_v2):
     # We need a protected import to avoid the V2 warning in case just V1 is used
@@ -28,9 +38,9 @@ class ClassificationPresetTrain:
         auto_augment_policy=None,
         ra_magnitude=9,
         augmix_severity=3,
-        random_erase_prob=0.0,
+        random_erase_prob=0.1,
         use_v2=False,
-    ):
+    ): 
         T = get_module(use_v2)
 
         transforms = []
@@ -38,9 +48,10 @@ class ClassificationPresetTrain:
         transforms.append(T.PILToTensor())
 
 
-        transforms.append(T.RandomResizedCrop(crop_size, interpolation=interpolation, antialias=True))
+        transforms.append(T.RandomResizedCrop(crop_size, interpolation=interpolation, scale=(0.7, 1.0), ratio=(0.8, 1.2), antialias=True))
         if hflip_prob > 0:
             transforms.append(T.RandomHorizontalFlip(hflip_prob))
+            transforms.append(T.RandomRotation(90))
         if auto_augment_policy is not None:
             if auto_augment_policy == "ra":
                 transforms.append(T.RandAugment(interpolation=interpolation, magnitude=ra_magnitude))
@@ -60,7 +71,7 @@ class ClassificationPresetTrain:
             ]
         )
         if random_erase_prob > 0:
-            transforms.append(T.RandomErasing(p=random_erase_prob))
+            transforms.append(T.RandomErasing(p=0.1))
 
         if use_v2:
             transforms.append(T.ToPureTensor())
@@ -79,7 +90,7 @@ class ClassificationPresetEval:
         resize_size=256,
         mean=(0.485, 0.456, 0.406), 
         std=(0.229, 0.224, 0.225),
-        interpolation=InterpolationMode.BICUBIC,
+        interpolation=InterpolationMode.BILINEAR,
         use_v2=False,
     ):
         T = get_module(use_v2)
@@ -105,9 +116,11 @@ class ClassificationPresetEval:
     def __call__(self, img):
         return self.transforms(img)
     
+
+
+
     
 def preprocess_train(batch, train_transforms):
-    """Apply train_transforms across a batch."""
     batch["pixel_values"] = [
         train_transforms(image.convert("RGB")) for image in batch["image"]
     ]
@@ -121,6 +134,7 @@ def preprocess_valid(batch, valid_transforms):
             valid_transforms(image.convert("RGB")) for image in batch["image"]
     ]
     return batch
+
 
 
 def load_dataset(dataset, args):
@@ -155,11 +169,35 @@ def load_dataset(dataset, args):
                 use_v2=args.use_v2,
             )
     
+    
     train_ds = dataset['train']
-    val_ds = dataset['test']
+    val_ds = dataset['valid']
     
     
     train_ds.set_transform(lambda batch: preprocess_train(batch, train_transform))
     val_ds.set_transform(lambda batch: preprocess_valid(batch, valid_transform))
 
     return train_ds, val_ds, train_transform, valid_transform
+
+
+def load_test_dataset(dataset, args):
+    val_resize_size, val_crop_size, train_crop_size = (
+        args.val_resize_size,
+        args.val_crop_size,
+        args.train_crop_size,
+    )
+    
+    interpolation = InterpolationMode(args.interpolation)
+    
+    valid_transform = ClassificationPresetEval(
+                crop_size=val_crop_size,
+                resize_size=val_resize_size,
+                interpolation=interpolation,
+                use_v2=args.use_v2,
+            )
+    
+    val_ds = dataset['test']
+    
+    val_ds.set_transform(lambda batch: preprocess_valid(batch, valid_transform))
+
+    return val_ds, valid_transform

@@ -1,0 +1,9 @@
+*.csv
+*.png
+data_batch_*
+*.meta
+*.html
+test_batch
+*.tar.gz
+data/hfdataset
+.DS_Store
