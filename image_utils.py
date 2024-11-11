@@ -17,7 +17,7 @@ from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay
 
 def save_confusion_matrix(y_preds, y_true, labels, save_dir, top_n=20):
     # Compute the confusion matrix
-    cm = confusion_matrix(y_true, y_preds, labels=labels)
+    cm = confusion_matrix(y_true, y_preds)
     
     # Calculate the support (total true instances per class)
     support = cm.sum(axis=1)
