@@ -22,7 +22,24 @@ cd huggingface_image
 - installation
 
 ```bash
-pip install huggingface
+pip install -r requirements.txt
+```
+
+- run docker file
+
+```bash
+docker build -t aicenter:huggingface_image_classification .
+docker run -d \
+  --name huggingface_image \
+  --gpus all \
+  -v $(pwd):/workspace \
+  -p 8888:8888 \
+  -p 6006:6006 \
+  -it \
+  -d \
+  --ipc=host \
+  aicenter:huggingface_image_classification \
+  /bin/bash
 ```
 
 - wandb login
